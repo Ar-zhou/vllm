@@ -3,15 +3,42 @@
 
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import prometheus_client
 
-from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
 from vllm.v1.metrics.utils import create_metric_per_engine
 
+if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
 logger = init_logger(__name__)
+
+
+@dataclass
+class AdaptiveVerificationStats:
+    """Draft slots before and after adaptive verification, excluding bonus tokens."""
+
+    proposed_draft_tokens: int
+    verified_draft_tokens: int
+
+    @property
+    def trimmed_draft_tokens(self) -> int:
+        return self.proposed_draft_tokens - self.verified_draft_tokens
+
+    @classmethod
+    def from_batch(
+        cls, input_batch: "InputBatch"
+    ) -> "AdaptiveVerificationStats | None":
+        # The per-request CPU counts remain untrimmed; the batch total is the
+        # admitted budget after reallocation. Neither requires a device copy.
+        widths = input_batch.num_draft_tokens_per_req
+        if widths is None or (proposed := int(widths.sum())) == 0:
+            return None
+        return cls(proposed, input_batch.num_draft_tokens)
 
 
 @dataclass
@@ -29,6 +56,7 @@ class SpecDecodingStats:
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
+    adaptive_verification_stats: AdaptiveVerificationStats | None = None
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -69,9 +97,15 @@ class SpecDecodingLogging:
         self.num_draft_tokens: list[int] = []
         self.num_accepted_tokens: list[int] = []
         self.accepted_tokens_per_pos_lists: list[list[int]] = []
+        self.adaptive_proposed_tokens = 0
+        self.adaptive_trimmed_tokens = 0
         self.last_log_time = time.monotonic()
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
+        adaptive = spec_decoding_stats.adaptive_verification_stats
+        if adaptive is not None:
+            self.adaptive_proposed_tokens += adaptive.proposed_draft_tokens
+            self.adaptive_trimmed_tokens += adaptive.trimmed_draft_tokens
         self.num_drafts.append(spec_decoding_stats.num_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
         self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
@@ -85,6 +119,19 @@ class SpecDecodingLogging:
         num_drafts = np.sum(self.num_drafts)
         num_draft_tokens = np.sum(self.num_draft_tokens)
         num_accepted_tokens = np.sum(self.num_accepted_tokens)
+        if self.adaptive_proposed_tokens:
+            log_fn(
+                "Adaptive verification metrics: "
+                "Proposed: %d tokens, Verified: %d tokens, Trimmed: %d tokens, "
+                "Trim ratio: %.1f%%",
+                self.adaptive_proposed_tokens,
+                self.adaptive_proposed_tokens - self.adaptive_trimmed_tokens,
+                self.adaptive_trimmed_tokens,
+                100 * self.adaptive_trimmed_tokens / self.adaptive_proposed_tokens,
+            )
+        if num_drafts == 0:
+            self.reset()
+            return
         draft_throughput = 0
         accepted_throughput = 0
 
@@ -199,7 +246,7 @@ class SpecDecodingProm:
 
     def __init__(
         self,
-        speculative_config: SpeculativeConfig | None,
+        speculative_config: "SpeculativeConfig | None",
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
         is_diffusion: bool = False,
@@ -244,6 +291,36 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_draft_tokens = counters[1]
         self.counter_spec_decode_num_accepted_tokens = counters[2]
 
+        self.counter_adaptive_proposed_draft_tokens: dict[
+            int, prometheus_client.Counter
+        ] = {}
+        self.counter_adaptive_trimmed_draft_tokens: dict[
+            int, prometheus_client.Counter
+        ] = {}
+        if (
+            not is_diffusion
+            and speculative_config is not None
+            and speculative_config.enable_adaptive_verification
+        ):
+            proposed_counter = self._counter_cls(
+                name="vllm:adaptive_proposed_draft_tokens",
+                documentation="Draft slots scheduled before adaptive trimming.",
+                labelnames=labelnames,
+            )
+            trimmed_counter = self._counter_cls(
+                name="vllm:adaptive_trimmed_draft_tokens",
+                documentation="Draft slots removed by adaptive verification.",
+                labelnames=labelnames,
+            )
+            self.counter_adaptive_proposed_draft_tokens = {
+                idx: proposed_counter.labels(*lv)
+                for idx, lv in per_engine_labelvalues.items()
+            }
+            self.counter_adaptive_trimmed_draft_tokens = {
+                idx: trimmed_counter.labels(*lv)
+                for idx, lv in per_engine_labelvalues.items()
+            }
+
         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
             int, list[prometheus_client.Counter]
         ] = {}
@@ -266,6 +343,14 @@ class SpecDecodingProm:
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
+        adaptive = spec_decoding_stats.adaptive_verification_stats
+        if adaptive is not None and self.counter_adaptive_proposed_draft_tokens:
+            self.counter_adaptive_proposed_draft_tokens[engine_idx].inc(
+                adaptive.proposed_draft_tokens
+            )
+            self.counter_adaptive_trimmed_draft_tokens[engine_idx].inc(
+                adaptive.trimmed_draft_tokens
+            )
         self.counter_spec_decode_num_drafts[engine_idx].inc(
             spec_decoding_stats.num_drafts
         )

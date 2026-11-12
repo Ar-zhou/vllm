@@ -13,6 +13,7 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.metrics import AdaptiveVerificationStats
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
@@ -303,6 +304,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    adaptive_verification_stats: AdaptiveVerificationStats | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

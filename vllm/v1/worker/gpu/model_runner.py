@@ -73,6 +73,7 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.spec_decode.metrics import AdaptiveVerificationStats
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -2136,6 +2137,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_stats=cudagraph_stats,
         )
         pending_aux_output = None
+        if self.adaptive_verification is not None:
+            model_runner_output.adaptive_verification_stats = (
+                AdaptiveVerificationStats.from_batch(input_batch)
+            )
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
 

@@ -45,3 +45,48 @@ Step costs are profiled against a synthetic KV context, 8192 tokens by default. 
 ```bash
 export VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN=131072
 ```
+
+## Measuring draft trimming
+
+With adaptive verification enabled, `/metrics` exposes two counters with the
+existing `model_name` and `engine` labels:
+
+- `vllm:adaptive_proposed_draft_tokens_total`: scheduled draft slots before
+  adaptive trimming.
+- `vllm:adaptive_trimmed_draft_tokens_total`: scheduled draft slots removed by
+  the adaptive budget before the target forward pass.
+
+The token-weighted trim ratio across engines is:
+
+```promql
+sum by (model_name) (rate(vllm:adaptive_trimmed_draft_tokens_total[5m]))
+/
+sum by (model_name) (rate(vllm:adaptive_proposed_draft_tokens_total[5m]))
+```
+
+For example, 20 scheduled drafts and a budget of 12 give a trim ratio of
+`(20 - 12) / 20 = 40%`. A zero budget counts all scheduled slots as trimmed;
+a full budget counts none. Batches without scheduled drafts do not contribute.
+When there are no draft observations in the query window, the ratio is undefined.
+The counters are only registered for adaptive verification, so a fixed-K run
+does not expose these time series.
+
+The regular statistics log also reports the totals and ratio for its interval:
+
+```text
+Adaptive verification metrics: Proposed: 20 tokens, Verified: 12 tokens, Trimmed: 8 tokens, Trim ratio: 40.0%
+```
+
+Counts exclude bonus tokens and graph padding. They describe scheduled draft
+slots, including placeholder slots, rather than all tokens produced by the draft
+model. Trimming includes the budget's logits-capacity limit. The measurements use
+CPU counts already available in the V2 GPU runner and add no device synchronization.
+They are carried with each model-runner output, including zero-budget steps and
+steps whose requests no longer produce live outputs.
+
+A high trim ratio shows that less draft verification work was admitted. It does
+not measure savings in draft generation or prove a throughput improvement.
+Compare output tokens/s and p95/p99 latency against a fixed-K run with the same
+model, workload, concurrency, sampling settings, hardware, and warmup. Existing
+speculative-decoding acceptance metrics retain their scheduler-based semantics;
+use the new counters for the trim ratio.

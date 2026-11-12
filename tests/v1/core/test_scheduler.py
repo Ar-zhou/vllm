@@ -67,11 +67,34 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metrics import AdaptiveVerificationStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("log_stats", [False, True])
+@pytest.mark.parametrize("verified", [0, 12, 20])
+def test_adaptive_stats_survive_without_live_request_outputs(log_stats, verified):
+    """Worker compute still counts when no requests survive to produce outputs."""
+    scheduler = create_scheduler(num_speculative_tokens=7)
+    scheduler.log_stats = log_stats
+    adaptive = AdaptiveVerificationStats(20, verified)
+    outputs = scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[], req_id_to_index={}, adaptive_verification_stats=adaptive
+        ),
+    )
+    if log_stats:
+        assert (
+            outputs[0].scheduler_stats.spec_decoding_stats.adaptive_verification_stats
+            == adaptive
+        )
+    else:
+        assert not outputs
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

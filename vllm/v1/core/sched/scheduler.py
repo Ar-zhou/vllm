@@ -2347,6 +2347,16 @@ class Scheduler(SchedulerInterface):
             finished_req_ids.clear()
 
         if (
+            self.log_stats
+            and model_runner_output.adaptive_verification_stats is not None
+        ):
+            if spec_decoding_stats is None:
+                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+            spec_decoding_stats.adaptive_verification_stats = (
+                model_runner_output.adaptive_verification_stats
+            )
+
+        if (
             stats := self.make_stats(
                 spec_decoding_stats,
                 kv_connector_stats,

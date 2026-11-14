@@ -1,0 +1,171 @@
+diff --git a/vllm_xds_patch/vllm/distributed/kv_transfer/kv_connector/v1/ems_store/dspark_cache.py b/vllm_xds_patch/vllm/distributed/kv_transfer/kv_connector/v1/ems_store/dspark_cache.py
+index 2ecd4a9..fd1ea07 100644
+--- a/vllm_xds_patch/vllm/distributed/kv_transfer/kv_connector/v1/ems_store/dspark_cache.py
++++ b/vllm_xds_patch/vllm/distributed/kv_transfer/kv_connector/v1/ems_store/dspark_cache.py
+@@ -12,6 +12,10 @@ import json
+ import os
+ from pathlib import Path
+ 
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
+ 
+ def is_glm_dspark(config):
+     spec = getattr(config, "speculative_config", None)
+@@ -80,8 +84,16 @@ class DSparkEmsCache:
+         from ems import PrimaryKey
+         group_first = index // adapter.block_group_size * adapter.block_group_size
+         rank = adapter.key_pp_rank if pp_rank is None else pp_rank
++        distribute_key = f"{adapter._key_prefix}@{hashes[group_first]}"
++        if stream == "swa":
++            # The EMS backend reserves xds@vllm keys for its prefix trie.
++            # Additional attributes under that prefix report save success but
++            # are absent on exists. Use an opaque stream key for draft KV;
++            # retain the legacy dense key for JE prefix hints and routing.
++            distribute_key = (
++                f"xds@dspark_swa@{self.namespace}@{hashes[group_first]}")
+         return PrimaryKey(
+-            f"{adapter._key_prefix}@{hashes[group_first]}",
++            distribute_key,
+             f"{hashes[index]}@{index}@pp{rank}@tp0@{self.namespace}@{stream}",
+         )
+ 
+@@ -102,7 +114,10 @@ class DSparkEmsCache:
+         for rank in range(self.pp_size):
+             keys = [self.key(adapter, hashes, i, "dense", rank)
+                     for i in range(computed, end)]
+-            end = min(end, computed + self._prefix_exists(adapter, keys))
++            matched = self._prefix_exists(adapter, keys)
++            logger.warning("EMS dSpark dense lookup: rank=%d matched=%d needed=%d first=%s",
++                        rank, matched, len(keys), keys[0] if keys else None)
++            end = min(end, computed + matched)
+         if not self.windowed_draft_kv:
+             # Full-prefix draft KV is stored in the same dense payload as
+             # target KV on the final PP rank. Both dense shards were checked
+@@ -111,16 +126,23 @@ class DSparkEmsCache:
+             return end - computed
+         # A dSpark drafter lives only on the final PP rank. Check the exact
+         # tail required by SlidingWindowManager, rather than all past SWA KV.
++        initial_end = end
+         while end > computed:
+             start = max(computed, max(0, end * self.store_size - self.window + 1)
+                         // self.store_size)
+             keys = [self.key(adapter, hashes, i, "swa", self.pp_size - 1)
+-                    for i in range(end - 1, start - 1, -1)]
++                    for i in range(start, end)]
+             matched = self._prefix_exists(adapter, keys)
++            if end == initial_end or matched == len(keys):
++                logger.warning("EMS dSpark SWA lookup: end=%d matched=%d needed=%d first=%s",
++                            end, matched, len(keys), keys[0] if keys else None)
+             if matched == len(keys):
+                 return end - computed
+-            # Every longer prefix includes the first missing window block.
+-            end -= matched + 1
++            # The SDK reports the matching prefix of the submitted keys.
++            # Query in increasing token order and retry at the first gap.
++            end = max(computed, start + matched)
++        logger.warning("EMS dSpark lookup found no complete SWA window: "
++                       "dense_end=%d computed=%d", initial_end, computed)
+         return 0
+ 
+     def _values(self, adapter, block_ids, relative, stream):
+@@ -157,6 +179,15 @@ class DSparkEmsCache:
+                 if buffers is None:
+                     if not save:
+                         raise ValueError("required EMS destination is missing or a null block")
++                    if stream == "swa":
++                        # An EMS producer must save every completed draft
++                        # block before the GPU window recycles its pages. A
++                        # missing source means the prefill chunk exceeded the
++                        # window or an in-flight step reused the page early.
++                        logger.error(
++                            "EMS dSpark draft KV source missing: block=%d "
++                            "computed=%d total=%d window=%d",
++                            i, computed, len(hashes), self.window)
+                     continue  # Evicted SWA pages must never be saved as real KV.
+                 if buffers:  # Empty groups on non-final PP ranks have no SWA key.
+                     keys.append(self.key(adapter, hashes, i, stream))
+diff --git a/vllm_xds_patch/vllm/v1/core/sched/scheduler.py b/vllm_xds_patch/vllm/v1/core/sched/scheduler.py
+index c2c4284..6249127 100644
+--- a/vllm_xds_patch/vllm/v1/core/sched/scheduler.py
++++ b/vllm_xds_patch/vllm/v1/core/sched/scheduler.py
+@@ -207,6 +207,48 @@ class XDSScheduler(VLLMPatch[Scheduler]):
+             else None
+         )
+         # ==== XDS patch end: dspark SWA prefill inflight limit ====
++
++        # The EMS dSpark connector saves newly produced SWA pages after each
++        # prefill step. A step larger than the draft window recycles its oldest
++        # pages before EMS can read them, leaving holes in the remote prefix.
++        # Keep the configured MNB as the batch budget; only cap one request's
++        # producer chunk and its in-flight tokens to the draft window.
++        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
++        spec = getattr(self.vllm_config, "speculative_config", None)
++        draft = getattr(spec, "draft_model_config", None)
++        draft_hf = getattr(draft, "hf_config", None)
++        draft_window = getattr(draft_hf, "sliding_window", None)
++        if draft_window is None:
++            layer_config = getattr(draft_hf, "transformer_layer_config", None)
++            draft_window = (layer_config.get("sliding_window")
++                            if isinstance(layer_config, dict)
++                            else getattr(layer_config, "sliding_window", None))
++        is_dspark_ems_producer = (
++            getattr(transfer, "kv_role", None) == "kv_producer"
++            and getattr(transfer, "kv_connector", None) == "MultiConnector"
++            and getattr(spec, "method", None) == "dspark"
++        )
++        logger.info(
++            "EMS dSpark scheduler gate: role=%s connector=%s method=%s "
++            "draft_window=%s enabled=%s",
++            getattr(transfer, "kv_role", None),
++            getattr(transfer, "kv_connector", None),
++            getattr(spec, "method", None), draft_window,
++            is_dspark_ems_producer)
++        if is_dspark_ems_producer and draft_window is None:
++            raise ValueError("EMS dSpark producer has no draft SWA window")
++        self.dspark_ems_swa_chunk_limit = (
++            draft_window if is_dspark_ems_producer else None)
++        if self.dspark_ems_swa_chunk_limit is not None:
++            limit = self.dspark_ems_swa_chunk_limit
++            if limit <= 0 or limit % self.cache_config.block_size:
++                raise ValueError("EMS dSpark SWA window must align to a KV block")
++            self.swa_prefill_inflight_limit = min(
++                self.swa_prefill_inflight_limit or limit, limit)
++            logger.info(
++                "EMS dSpark draft SWA: per-request prefill and in-flight "
++                "limit=%d, batch budget=%d",
++                limit, self.scheduler_config.max_num_batched_tokens)
+     def _preempt_request(self, request: Request, timestamp: float,
+                          drop_stale_output: bool = False) -> None:
+         self._step_num_preemptions += 1
+@@ -415,6 +457,16 @@ class XDSScheduler(VLLMPatch[Scheduler]):
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
+ 
++            if (
++                self.dspark_ems_swa_chunk_limit is not None
++                and request.num_computed_tokens < request.num_prompt_tokens
++            ):
++                num_new_tokens = min(
++                    num_new_tokens,
++                    max(0, self.dspark_ems_swa_chunk_limit
++                        - request.num_in_flight_tokens),
++                )
++
+             # ==== XDS patch begin: dspark SWA prefill inflight cap ====
+             if (
+                 self.swa_prefill_inflight_limit is not None
+@@ -899,6 +951,12 @@ class XDSScheduler(VLLMPatch[Scheduler]):
+                         break
+ 
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
++                    if (
++                        self.dspark_ems_swa_chunk_limit is not None
++                        and num_computed_tokens < request.num_prompt_tokens
++                    ):
++                        num_new_tokens = min(
++                            num_new_tokens, self.dspark_ems_swa_chunk_limit)
+                     assert num_new_tokens > 0
+ 
+                     # Apply Mamba alignment before encoder caps.

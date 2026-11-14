@@ -1,0 +1,8 @@
+test,requests,http_200,prompt_tokens,cached_tokens,cache_ratio_percent,TTFT_P50_s,TTFT_P95_s,TTFT_P99_s,notes
+27K_cold,1,1,27021,0,0,10.212,,,first write; suffix test 1
+27K_EMS_warm,1,1,27021,27008,99.95,1.080,,,GPU prefix reset; PP0 load 422/422 and PP1 load 550/550
+1180_cold_first96,96,96,25167071,0,0,78.78,96.40,118.51,262K-class prompts; 8 inflight; 1.2 target QPS; one output token
+1180_warm1080_1TiB_namespace,1080,1080,90350284,62904576,69.62,7.69,22.96,36.89,initial full run
+1180_warm1080_2TiB_namespace,1080,1080,90350284,63082560,69.82,7.70,,,same capture data; separate run
+1180_warm1080_2TiB_eviction98_95,1080,1080,90350284,64279744,71.15,7.605,,,same capture data; separate run; EMS eviction thresholds 98/95
+27K_512_output,3,3,,,,,,,TPOT 6.43/8.70/7.22 ms per token; median 7.22

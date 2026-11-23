@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import CacheConfig, VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -10,6 +10,26 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     get_target_lm_head,
     maybe_share_target_embed,
 )
+
+
+def get_draft_cache_config(vllm_config: VllmConfig) -> CacheConfig:
+    """Return a cache config whose layout is valid for the draft model.
+
+    ``nvfp4_ds_mla`` is a packed sparse-MLA target layout, not a generic
+    draft-model KV dtype. Let the draft select its own layout unless the user
+    explicitly requested one in ``speculative_config.kv_cache_dtype``.
+    """
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    draft_cache_dtype = speculative_config.kv_cache_dtype
+    if (
+        draft_cache_dtype is None
+        and vllm_config.cache_config.cache_dtype == "nvfp4_ds_mla"
+    ):
+        draft_cache_dtype = "auto"
+    if draft_cache_dtype is None:
+        return vllm_config.cache_config
+    return replace(vllm_config.cache_config, cache_dtype=draft_cache_dtype)
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -30,14 +50,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=speculative_config.attention_backend,
         ),
-        cache_config=(
-            replace(
-                vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
-            )
-            if speculative_config.kv_cache_dtype is not None
-            else vllm_config.cache_config
-        ),
+        cache_config=get_draft_cache_config(vllm_config),
         load_config=get_draft_load_config(vllm_config),
     )
     draft_vllm_config = speculative_config.apply_draft_eplb_overrides(draft_vllm_config)
